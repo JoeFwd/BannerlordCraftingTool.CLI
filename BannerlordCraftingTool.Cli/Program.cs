@@ -278,6 +278,8 @@ static void Render(IReadOnlyDictionary<string, List<string>> options)
 
 static void RenderImage(List<RenderPiece> pieces, float[] min, float[] max, string imagePath)
 {
+    EnsureWindowsDirectoryEnvironmentVariable();
+
     Exception? err = null;
     var thread = new Thread(() =>
     {
@@ -331,6 +333,26 @@ static void RenderImage(List<RenderPiece> pieces, float[] min, float[] max, stri
     thread.Start();
     thread.Join();
     if (err != null) throw err;
+}
+
+static void EnsureWindowsDirectoryEnvironmentVariable()
+{
+    if (!string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("windir")))
+        return;
+
+    var windowsDirectory = Environment.GetEnvironmentVariable("SystemRoot");
+    if (string.IsNullOrWhiteSpace(windowsDirectory))
+        windowsDirectory = Environment.GetFolderPath(Environment.SpecialFolder.Windows);
+
+    if (string.IsNullOrWhiteSpace(windowsDirectory)
+        || !Path.IsPathFullyQualified(windowsDirectory)
+        || !Directory.Exists(Path.Combine(windowsDirectory, "Fonts")))
+    {
+        throw new InvalidOperationException(
+            "WPF rendering requires a valid Windows directory, but neither 'windir' nor 'SystemRoot' is available.");
+    }
+
+    Environment.SetEnvironmentVariable("windir", windowsDirectory, EnvironmentVariableTarget.Process);
 }
 
 static RenderTargetBitmap RenderView(Model3DGroup group, Point3D center, Vector3D viewDir, Vector3D up,
