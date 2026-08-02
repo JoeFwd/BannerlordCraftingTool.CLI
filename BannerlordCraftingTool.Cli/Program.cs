@@ -1,5 +1,6 @@
 using System.Globalization;
 using System.IO;
+using System.Text;
 using System.Text.Json;
 using System.Threading;
 using System.Windows;
@@ -16,7 +17,7 @@ try
 {
     if (args.Length == 0 || args[0] is "--help" or "-h")
     {
-    Console.WriteLine("Usage:\n  BannerlordCraftingTool.Cli extract --pieces <crafting_pieces.xml> [--out <report.json>]\n  BannerlordCraftingTool.Cli inspect --submodule <SubModule.xml> --weapon <CraftedItem-id> [--weapon <CraftedItem-id> ...] [--out <report.json>]\n  BannerlordCraftingTool.Cli audit --submodule <SubModule.xml> --fbx-folder <folder> (--all-templates | --template <id> ...) [--tolerance <xml-units>] [--out <report.json>]\n  BannerlordCraftingTool.Cli render --submodule <SubModule.xml> --weapon <CraftedItem-id> --fbx-folder <folder> --out <dir>\n\n  The module dependency stack is resolved from SubModule.xml; use --modules-root <Modules> to override the selected module's parent directory.\n  audit measures visual mesh bounds from FBX source geometry using fixed-reference adjacent-piece sweeps; it never edits XML.\n  render assembles the weapon as the GUI does, renders three orthographic views to <dir>\\render.png, and emits 3D measurements to <dir>\\render.json.\n  One --weapon returns a flat report; repeated --weapon returns { weapons, source_files }.\n  layout is a compatibility alias for inspect.");
+    Console.WriteLine("Usage:\n  BannerlordCraftingTool.Cli extract --pieces <crafting_pieces.xml> [--out <report.json>]\n  BannerlordCraftingTool.Cli inspect --submodule <SubModule.xml> --weapon <CraftedItem-id> [--weapon <CraftedItem-id> ...] [--out <report.json>]\n  BannerlordCraftingTool.Cli audit --submodule <SubModule.xml> --fbx-folder <folder> (--all-templates | --template <id> ...) [--all-pairs [--render-dir <dir>]] [--scale-percent <positive-integer>] [--tolerance <xml-units>] [--out <report.json>]\n  BannerlordCraftingTool.Cli render --submodule <SubModule.xml> --weapon <CraftedItem-id> --fbx-folder <folder> --out <dir>\n\n  The module dependency stack is resolved from SubModule.xml; use --modules-root <Modules> to override the selected module's parent directory.\n  An --fbx-folder directly under AssetSources expands to the AssetSources root so sibling FBX collections are included.\n  audit measures visual mesh bounds across physically adjacent pieces; default_polearm_guard/pommel placeholder slots are collapsed.\n  --scale-percent uniformly scales every audit piece and defaults to 100.\n  --all-pairs checks every player-selectable physical pair, and --render-dir writes pair PNGs plus declared-type piece galleries.\n  audit never edits XML. render assembles the weapon as the GUI does, renders three orthographic views to <dir>\\render.png, and emits 3D measurements to <dir>\\render.json.\n  One --weapon returns a flat report; repeated --weapon returns { weapons, source_files }.\n  layout is a compatibility alias for inspect.");
         return;
     }
 
@@ -92,11 +93,22 @@ static void Layout(IReadOnlyDictionary<string, List<string>> options)
     WriteJson(new { weapons = reports, source_files = sourceFiles }, options);
 }
 
+static string ResolveFbxSearchRoot(string folder)
+{
+    var fullPath = Path.GetFullPath(folder);
+    var directory = new DirectoryInfo(fullPath);
+    return directory.Parent?.Name.Equals("AssetSources", StringComparison.OrdinalIgnoreCase) == true
+        ? directory.Parent.FullName
+        : fullPath;
+}
+
 static void Audit(IReadOnlyDictionary<string, List<string>> options)
 {
     var subModule = RequiredOption(options, "submodule");
-    var fbxFolder = RequiredOption(options, "fbx-folder");
-    if (!Directory.Exists(fbxFolder)) throw new ArgumentException($"FBX folder does not exist: '{fbxFolder}'.");
+    var requestedFbxFolder = RequiredOption(options, "fbx-folder");
+    if (!Directory.Exists(requestedFbxFolder))
+        throw new ArgumentException($"FBX folder does not exist: '{requestedFbxFolder}'.");
+    var fbxFolder = ResolveFbxSearchRoot(requestedFbxFolder);
     var allTemplates = options.ContainsKey("all-templates");
     var requestedTemplates = options.TryGetValue("template", out var templateIds) ? templateIds : [];
     if (allTemplates == (requestedTemplates.Count > 0))
@@ -104,6 +116,16 @@ static void Audit(IReadOnlyDictionary<string, List<string>> options)
     var tolerance = options.TryGetValue("tolerance", out var toleranceValues)
         ? ParseNonNegativeFloat(SingleOption(toleranceValues, "tolerance"), "tolerance")
         : 0.01f;
+    var scalePercent = options.TryGetValue("scale-percent", out var scalePercentValues)
+        ? ParsePositiveInt(SingleOption(scalePercentValues, "scale-percent"), "scale-percent")
+        : 100;
+    var allPairs = options.ContainsKey("all-pairs");
+    var renderDir = options.TryGetValue("render-dir", out var renderDirValues)
+        ? Path.GetFullPath(SingleOption(renderDirValues, "render-dir"))
+        : null;
+    if (renderDir is not null && !allPairs)
+        throw new ArgumentException("--render-dir requires --all-pairs.");
+    if (renderDir is not null) Directory.CreateDirectory(renderDir);
 
     var data = LoadSubModuleCraftingData(subModule, options);
     var piecesById = data.Pieces.ToDictionary(piece => piece.Id, StringComparer.OrdinalIgnoreCase);
@@ -113,8 +135,12 @@ static void Audit(IReadOnlyDictionary<string, List<string>> options)
             ? template
             : throw new ArgumentException($"No CraftingTemplate with id '{templateId}' was found in resolved CraftingTemplates XML.")).ToList();
     var meshBounds = new FbxBoundsIndex(fbxFolder);
+    var meshIndex = renderDir is null ? null : new FbxMeshIndex(fbxFolder);
     var records = new List<VisualAuditRecord>();
+    var pieceImages = new List<PieceVisualRecord>();
+    var collapsedPlaceholderSlots = new List<CollapsedPlaceholderSlot>();
     var skipped = new List<AuditSkip>();
+    var pairIndex = 0;
 
     foreach (var template in templates)
     {
@@ -142,27 +168,60 @@ static void Audit(IReadOnlyDictionary<string, List<string>> options)
             foreach (var missingType in missingTypes) skipped.Add(new AuditSkip(template.Id, "missing_usable_piece_type", missingType));
             continue;
         }
-        foreach (var pair in ordered.Zip(ordered.Skip(1)))
+        if (renderDir is not null && meshIndex is not null)
+        {
+            foreach (var piece in usableByType.Values.SelectMany(value => value).DistinctBy(piece => piece.Id, StringComparer.OrdinalIgnoreCase))
+                pieceImages.Add(RenderPieceVisual(template.Id, piece, meshIndex, renderDir, scalePercent));
+        }
+        var collapsedTypes = usableByType
+            .Where(entry => entry.Value.Any(IsDefaultPolearmPlaceholder))
+            .Select(entry => entry.Key)
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        foreach (var collapsedType in collapsedTypes)
+            collapsedPlaceholderSlots.Add(new CollapsedPlaceholderSlot(template.Id, collapsedType));
+        var physicalOrder = ordered.Where(order => !collapsedTypes.Contains(order.Type)).ToArray();
+        foreach (var pair in physicalOrder.Zip(physicalOrder.Skip(1)))
         {
             var gripPieces = usableByType[pair.First.Type];
             var tipPieces = usableByType[pair.Second.Type];
 
+            if (allPairs)
+            {
+                foreach (var grip in gripPieces)
+                foreach (var tip in tipPieces)
+                {
+                    var record = CreateVisualAuditRecord(template, pair.First, pair.Second, grip, tip, "pair", usableByType, piecesById, meshBounds, tolerance, scalePercent);
+                    if (renderDir is not null && meshIndex is not null)
+                    {
+                        var rendered = RenderAuditPair(template, pair.First, pair.Second, grip, tip, usableByType, piecesById, meshIndex, renderDir, pairIndex, scalePercent);
+                        record = record with { Image = rendered.Image, RenderedPieces = rendered.Pieces };
+                    }
+                    records.Add(record);
+                    pairIndex++;
+                }
+                continue;
+            }
+
             var gripReference = gripPieces[0];
             var tipReference = tipPieces[0];
-            var baseline = CreateVisualAuditRecord(template, pair.First, pair.Second, gripReference, tipReference, "grip", usableByType, piecesById, meshBounds, tolerance);
+            var baseline = CreateVisualAuditRecord(template, pair.First, pair.Second, gripReference, tipReference, "grip", usableByType, piecesById, meshBounds, tolerance, scalePercent);
             foreach (var candidate in gripPieces)
-                records.Add(WithCorrectionPlan(CreateVisualAuditRecord(template, pair.First, pair.Second, candidate, tipReference, "grip", usableByType, piecesById, meshBounds, tolerance), baseline));
+                records.Add(WithCorrectionPlan(CreateVisualAuditRecord(template, pair.First, pair.Second, candidate, tipReference, "grip", usableByType, piecesById, meshBounds, tolerance, scalePercent), baseline));
             foreach (var candidate in tipPieces.Skip(1))
-                records.Add(WithCorrectionPlan(CreateVisualAuditRecord(template, pair.First, pair.Second, gripReference, candidate, "tip", usableByType, piecesById, meshBounds, tolerance), baseline));
+                records.Add(WithCorrectionPlan(CreateVisualAuditRecord(template, pair.First, pair.Second, gripReference, candidate, "tip", usableByType, piecesById, meshBounds, tolerance, scalePercent), baseline));
         }
     }
 
     WriteJson(new
     {
-        audit_strategy = "fixed_reference_adjacent_piece_sweep",
+        audit_strategy = allPairs ? "complete_player_selectable_physical_pair_sweep" : "fixed_reference_physical_piece_sweep",
+        scale_percent = scalePercent,
         tolerance,
         fbx_folder = Path.GetFullPath(fbxFolder),
+        render_dir = renderDir,
         records,
+        piece_images = pieceImages,
+        collapsed_placeholder_slots = collapsedPlaceholderSlots,
         skipped,
         summary = new
         {
@@ -178,8 +237,10 @@ static void Render(IReadOnlyDictionary<string, List<string>> options)
 {
     var subModule = RequiredOption(options, "submodule");
     var weaponId = RequiredOption(options, "weapon");
-    var fbxFolder = RequiredOption(options, "fbx-folder");
-    if (!Directory.Exists(fbxFolder)) throw new ArgumentException($"FBX folder does not exist: '{fbxFolder}'.");
+    var requestedFbxFolder = RequiredOption(options, "fbx-folder");
+    if (!Directory.Exists(requestedFbxFolder))
+        throw new ArgumentException($"FBX folder does not exist: '{requestedFbxFolder}'.");
+    var fbxFolder = ResolveFbxSearchRoot(requestedFbxFolder);
     var outDir = RequiredOption(options, "out");
     Directory.CreateDirectory(outDir);
 
@@ -190,35 +251,8 @@ static void Render(IReadOnlyDictionary<string, List<string>> options)
     var meshIndex = new FbxMeshIndex(fbxFolder);
     var orderedPieces = layout.Pieces.OrderBy(piece => piece.BuildOrder).ToList();
 
-    var assembled = new List<RenderPiece>();
-    var missing = new List<string>();
-    foreach (var piece in orderedPieces)
-    {
-        var geo = meshIndex.LoadMesh(piece.Mesh);
-        var scale = piece.ScaleFactor * 0.01f;
-        var pivot = piece.Pivot;
-        Bounds? worldBounds = null;
-        if (geo is not null)
-        {
-            float minX = float.PositiveInfinity, minY = float.PositiveInfinity, minZ = float.PositiveInfinity;
-            float maxX = float.NegativeInfinity, maxY = float.NegativeInfinity, maxZ = float.NegativeInfinity;
-            foreach (var p in geo.Positions)
-            {
-                var x = (float)p.X * scale;
-                var y = (float)p.Y * scale + pivot;
-                var z = (float)p.Z * scale;
-                minX = MathF.Min(minX, x); maxX = MathF.Max(maxX, x);
-                minY = MathF.Min(minY, y); maxY = MathF.Max(maxY, y);
-                minZ = MathF.Min(minZ, z); maxZ = MathF.Max(maxZ, z);
-            }
-            worldBounds = new Bounds(minX, minY, minZ, maxX, maxY, maxZ);
-        }
-        else
-        {
-            missing.Add(piece.Mesh);
-        }
-        assembled.Add(new RenderPiece(piece.Type, piece.Id, piece.Mesh, piece.ScaleFactor, piece.Pivot, geo, scale, pivot, worldBounds));
-    }
+    var assembled = AssembleRenderPieces(orderedPieces, meshIndex);
+    var missing = assembled.Where(piece => piece.Geometry is null).Select(piece => piece.Mesh).ToList();
 
     var found = assembled.Where(piece => piece.Bounds is not null).ToList();
     var imagePath = Path.GetFullPath(Path.Combine(outDir, "render.png"));
@@ -226,29 +260,12 @@ static void Render(IReadOnlyDictionary<string, List<string>> options)
     BoundsReport? assembledBounds = null;
     if (found.Count > 0)
     {
-        var min = new[] {
-            found.Min(p => p.Bounds!.MinX), found.Min(p => p.Bounds!.MinY), found.Min(p => p.Bounds!.MinZ) };
-        var max = new[] {
-            found.Max(p => p.Bounds!.MaxX), found.Max(p => p.Bounds!.MaxY), found.Max(p => p.Bounds!.MaxZ) };
+        var (min, max) = CombinedBounds(found);
         assembledBounds = new BoundsReport(min, max);
         RenderImage(found, min, max, imagePath);
     }
 
-    var pieceReports = assembled.Select(piece =>
-    {
-        var b = piece.Bounds;
-        return new RenderPieceReport(
-            piece.Type,
-            piece.Id,
-            piece.Mesh,
-            piece.ScaleFactor,
-            piece.PivotXml,
-            b is not null,
-            b is null ? null : new BoundsReport([b.MinX, b.MinY, b.MinZ], [b.MaxX, b.MaxY, b.MaxZ]),
-            b is null ? null : [ (b.MinX + b.MaxX) / 2f, (b.MinY + b.MaxY) / 2f, (b.MinZ + b.MaxZ) / 2f ],
-            b is null ? null : new LateralOffset((b.MinX + b.MaxX) / 2f, (b.MinZ + b.MaxZ) / 2f),
-            b is null ? null : new AxisExtent(b.MinY, b.MaxY));
-    }).ToList();
+    var pieceReports = assembled.Select(ToRenderPieceReport).ToList();
 
     var seams = new List<RenderSeam>();
     for (var i = 0; i + 1 < assembled.Count; i++)
@@ -276,7 +293,55 @@ static void Render(IReadOnlyDictionary<string, List<string>> options)
     Console.WriteLine(json);
 }
 
-static void RenderImage(List<RenderPiece> pieces, float[] min, float[] max, string imagePath)
+static List<RenderPiece> AssembleRenderPieces(IEnumerable<PieceReport> pieces, FbxMeshIndex meshIndex) =>
+    pieces.Select(piece => CreateRenderPiece(piece.Type, piece.Id, piece.Mesh, piece.ScaleFactor, piece.Pivot, meshIndex)).ToList();
+
+static RenderPiece CreateRenderPiece(string type, string id, string mesh, int scaleFactor, float pivot, FbxMeshIndex meshIndex)
+{
+    var geometry = meshIndex.LoadMesh(mesh);
+    var scale = scaleFactor * 0.01f;
+    Bounds? worldBounds = null;
+    if (geometry is not null)
+    {
+        float minX = float.PositiveInfinity, minY = float.PositiveInfinity, minZ = float.PositiveInfinity;
+        float maxX = float.NegativeInfinity, maxY = float.NegativeInfinity, maxZ = float.NegativeInfinity;
+        foreach (var point in geometry.Positions)
+        {
+            var x = (float)point.X * scale;
+            var y = (float)point.Y * scale + pivot;
+            var z = (float)point.Z * scale;
+            minX = MathF.Min(minX, x); maxX = MathF.Max(maxX, x);
+            minY = MathF.Min(minY, y); maxY = MathF.Max(maxY, y);
+            minZ = MathF.Min(minZ, z); maxZ = MathF.Max(maxZ, z);
+        }
+        worldBounds = new Bounds(minX, minY, minZ, maxX, maxY, maxZ);
+    }
+    return new RenderPiece(type, id, mesh, scaleFactor, pivot, geometry, scale, pivot, worldBounds);
+}
+
+static (float[] Min, float[] Max) CombinedBounds(IReadOnlyCollection<RenderPiece> pieces) =>
+(
+    [pieces.Min(piece => piece.Bounds!.MinX), pieces.Min(piece => piece.Bounds!.MinY), pieces.Min(piece => piece.Bounds!.MinZ)],
+    [pieces.Max(piece => piece.Bounds!.MaxX), pieces.Max(piece => piece.Bounds!.MaxY), pieces.Max(piece => piece.Bounds!.MaxZ)]
+);
+
+static RenderPieceReport ToRenderPieceReport(RenderPiece piece)
+{
+    var bounds = piece.Bounds;
+    return new RenderPieceReport(
+        piece.Type,
+        piece.Id,
+        piece.Mesh,
+        piece.ScaleFactor,
+        piece.PivotXml,
+        bounds is not null,
+        bounds is null ? null : new BoundsReport([bounds.MinX, bounds.MinY, bounds.MinZ], [bounds.MaxX, bounds.MaxY, bounds.MaxZ]),
+        bounds is null ? null : [(bounds.MinX + bounds.MaxX) / 2f, (bounds.MinY + bounds.MaxY) / 2f, (bounds.MinZ + bounds.MaxZ) / 2f],
+        bounds is null ? null : new LateralOffset((bounds.MinX + bounds.MaxX) / 2f, (bounds.MinZ + bounds.MaxZ) / 2f),
+        bounds is null ? null : new AxisExtent(bounds.MinY, bounds.MaxY));
+}
+
+static void RenderImage(List<RenderPiece> pieces, float[] min, float[] max, string imagePath, bool compact = false)
 {
     EnsureWindowsDirectoryEnvironmentVariable();
 
@@ -305,7 +370,9 @@ static void RenderImage(List<RenderPiece> pieces, float[] min, float[] max, stri
             var maxSpan = Math.Max(span[0], Math.Max(span[1], span[2]));
             var distance = Math.Max(maxSpan * 3.0, 1.0);
 
-            const int tallW = 360, tallH = 1000, topSize = 360;
+            var tallW = compact ? 240 : 360;
+            var tallH = compact ? 560 : 1000;
+            var topSize = compact ? 240 : 360;
             var background = (Color)ColorConverter.ConvertFromString("#202020")!;
 
             // side: look down -Z, up +Y; horizontal axis = X, vertical axis = Y
@@ -429,6 +496,35 @@ static Color PieceColor(string type) => type.ToLowerInvariant() switch
     _ => (Color)ColorConverter.ConvertFromString("#B0B0B0")!,
 };
 
+static bool IsDefaultPolearmPlaceholder(CraftingPiece piece) =>
+    string.IsNullOrWhiteSpace(piece.Mesh) &&
+    (piece.Id.Equals("default_polearm_guard", StringComparison.OrdinalIgnoreCase)
+     || piece.Id.Equals("default_polearm_pommel", StringComparison.OrdinalIgnoreCase));
+
+static CraftingPiece AuditReferencePiece(IReadOnlyList<CraftingPiece> pieces) =>
+    pieces.FirstOrDefault(IsDefaultPolearmPlaceholder) ?? pieces[0];
+
+static WeaponLayoutReport CreateAuditLayout(
+    TemplateData template,
+    BuildOrder gripOrder,
+    BuildOrder tipOrder,
+    CraftingPiece grip,
+    CraftingPiece tip,
+    IReadOnlyDictionary<string, List<CraftingPiece>> usableByType,
+    IReadOnlyDictionary<string, CraftingPiece> piecesById,
+    int scalePercent)
+{
+    var selected = template.BuildOrder.Select(order =>
+    {
+        var piece = order.Type.Equals(gripOrder.Type, StringComparison.OrdinalIgnoreCase) ? grip
+            : order.Type.Equals(tipOrder.Type, StringComparison.OrdinalIgnoreCase) ? tip
+            : AuditReferencePiece(usableByType[order.Type]);
+        return new PieceRequest(order.Type, piece.Id, scalePercent);
+    }).ToList();
+    return CalculateLayout(new WeaponRequest("audit", template.Id, selected), piecesById,
+        new Dictionary<string, BuildOrder[]>(StringComparer.OrdinalIgnoreCase) { [template.Id] = template.BuildOrder });
+}
+
 static VisualAuditRecord CreateVisualAuditRecord(
     TemplateData template,
     BuildOrder gripOrder,
@@ -439,17 +535,10 @@ static VisualAuditRecord CreateVisualAuditRecord(
     IReadOnlyDictionary<string, List<CraftingPiece>> usableByType,
     IReadOnlyDictionary<string, CraftingPiece> piecesById,
     FbxBoundsIndex meshBounds,
-    float tolerance)
+    float tolerance,
+    int scalePercent)
 {
-    var selected = template.BuildOrder.Select(order =>
-    {
-        var piece = order.Type.Equals(gripOrder.Type, StringComparison.OrdinalIgnoreCase) ? grip
-            : order.Type.Equals(tipOrder.Type, StringComparison.OrdinalIgnoreCase) ? tip
-            : usableByType[order.Type][0];
-        return new PieceRequest(order.Type, piece.Id, 100);
-    }).ToList();
-    var layout = CalculateLayout(new WeaponRequest("audit", template.Id, selected), piecesById,
-        new Dictionary<string, BuildOrder[]>(StringComparer.OrdinalIgnoreCase) { [template.Id] = template.BuildOrder });
+    var layout = CreateAuditLayout(template, gripOrder, tipOrder, grip, tip, usableByType, piecesById, scalePercent);
     var gripReport = layout.Pieces.Single(piece => piece.Type.Equals(gripOrder.Type, StringComparison.OrdinalIgnoreCase));
     var tipReport = layout.Pieces.Single(piece => piece.Type.Equals(tipOrder.Type, StringComparison.OrdinalIgnoreCase));
     var missing = new List<string>();
@@ -468,6 +557,64 @@ static VisualAuditRecord CreateVisualAuditRecord(
         new MeshExtent(tip.Mesh, tipBounds?.MinY, tipBounds?.MaxY, tipReport.Pivot),
         new AuditCandidate(candidate.Id, candidate.Type, candidate.Mesh, candidate.ScaleFactor,
             new BuildDataValues(candidate.PieceOffset, candidate.PreviousPieceOffset, candidate.NextPieceOffset)));
+}
+
+static PairVisualResult RenderAuditPair(
+    TemplateData template,
+    BuildOrder gripOrder,
+    BuildOrder tipOrder,
+    CraftingPiece grip,
+    CraftingPiece tip,
+    IReadOnlyDictionary<string, List<CraftingPiece>> usableByType,
+    IReadOnlyDictionary<string, CraftingPiece> piecesById,
+    FbxMeshIndex meshIndex,
+    string renderDir,
+    int index,
+    int scalePercent)
+{
+    var layout = CreateAuditLayout(template, gripOrder, tipOrder, grip, tip, usableByType, piecesById, scalePercent);
+    var reports = layout.Pieces
+        .Where(piece => piece.Type.Equals(gripOrder.Type, StringComparison.OrdinalIgnoreCase)
+            || piece.Type.Equals(tipOrder.Type, StringComparison.OrdinalIgnoreCase))
+        .OrderBy(piece => piece.BuildOrder)
+        .ToList();
+    var assembled = AssembleRenderPieces(reports, meshIndex);
+    var found = assembled.Where(piece => piece.Bounds is not null).ToList();
+    string? imagePath = null;
+    if (found.Count > 0)
+    {
+        var join = $"{SafePathSegment(gripOrder.Type)}-{SafePathSegment(tipOrder.Type)}";
+        var folder = Path.Combine(renderDir, "pairs", SafePathSegment(template.Id), join);
+        Directory.CreateDirectory(folder);
+        var fileName = $"{index:D4}__{SafePathSegment(grip.Id, 24)}__{SafePathSegment(tip.Id, 24)}.png";
+        imagePath = Path.GetFullPath(Path.Combine(folder, fileName));
+        var (min, max) = CombinedBounds(found);
+        RenderImage(found, min, max, imagePath, compact: true);
+    }
+    return new PairVisualResult(imagePath, assembled.Select(ToRenderPieceReport).ToList());
+}
+
+static PieceVisualRecord RenderPieceVisual(string templateId, CraftingPiece piece, FbxMeshIndex meshIndex, string renderDir, int scalePercent)
+{
+    var assembled = CreateRenderPiece(piece.PieceType, piece.Id, piece.Mesh, scalePercent, 0, meshIndex);
+    string? imagePath = null;
+    if (assembled.Bounds is not null)
+    {
+        var folder = Path.Combine(renderDir, "pieces", SafePathSegment(templateId), SafePathSegment(piece.PieceType));
+        Directory.CreateDirectory(folder);
+        imagePath = Path.GetFullPath(Path.Combine(folder, $"{SafePathSegment(piece.Id, 80)}.png"));
+        var (min, max) = CombinedBounds([assembled]);
+        RenderImage([assembled], min, max, imagePath, compact: true);
+    }
+    return new PieceVisualRecord(templateId, piece.Id, piece.PieceType, piece.Mesh, imagePath, ToRenderPieceReport(assembled));
+}
+
+static string SafePathSegment(string value, int maxLength = 64)
+{
+    var invalid = Path.GetInvalidFileNameChars().ToHashSet();
+    var safe = new string(value.Select(character => invalid.Contains(character) ? '_' : character).ToArray()).Trim();
+    if (safe.Length == 0) safe = "_";
+    return safe.Length <= maxLength ? safe : safe[..maxLength];
 }
 
 static VisualAuditRecord WithCorrectionPlan(VisualAuditRecord record, VisualAuditRecord baseline)
@@ -911,7 +1058,8 @@ static Dictionary<string, List<string>> ReadOptions(string[] arguments)
             throw new ArgumentException($"Expected an option and value, got '{arguments[index]}'.");
         var name = arguments[index][2..];
         if (!options.TryGetValue(name, out var values)) options[name] = values = [];
-        if (name.Equals("all-templates", StringComparison.OrdinalIgnoreCase))
+        if (name.Equals("all-templates", StringComparison.OrdinalIgnoreCase)
+            || name.Equals("all-pairs", StringComparison.OrdinalIgnoreCase))
         {
             values.Add("true");
             index++;
@@ -938,6 +1086,13 @@ static float ParseNonNegativeFloat(string value, string name)
 {
     if (!TryParseFloat(value, out var result) || result < 0)
         throw new ArgumentException($"--{name} must be a non-negative number.");
+    return result;
+}
+
+static int ParsePositiveInt(string value, string name)
+{
+    if (!int.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture, out var result) || result <= 0)
+        throw new ArgumentException($"--{name} must be a positive integer.");
     return result;
 }
 
@@ -1009,6 +1164,7 @@ sealed record WeaponLayoutReport(string Id, string Template, BuildOrder[] BuildO
 sealed record MeshBounds(float MinY, float MaxY);
 sealed record MeshExtent(string Mesh, float? LocalMinY, float? LocalMaxY, float Pivot);
 sealed record AuditSkip(string Template, string Reason, string? Joint);
+sealed record CollapsedPlaceholderSlot(string Template, string PieceType);
 sealed record BuildDataValues(float PieceOffset, float PreviousPieceOffset, float NextPieceOffset);
 sealed record AuditCandidate(string Id, string Type, string Mesh, int ScalePercent, BuildDataValues BuildData);
 sealed record AuditBaseline(string GripId, string TipId, float? VisualGap, bool Aligned, bool Complete);
@@ -1036,6 +1192,8 @@ sealed record VisualAuditRecord(
     public bool IsBaseline { get; init; }
     public AuditBaseline? Baseline { get; init; }
     public CorrectionPlan? CorrectionPlan { get; init; }
+    public string? Image { get; init; }
+    public List<RenderPieceReport>? RenderedPieces { get; init; }
 }
 
 sealed record Bounds(float MinX, float MinY, float MinZ, float MaxX, float MaxY, float MaxZ);
@@ -1055,10 +1213,13 @@ sealed record RenderPieceReport(
     LateralOffset? LateralOffset,
     AxisExtent? AxisExtent);
 sealed record RenderSeam(string GripType, string TipType, float AxisGap);
+sealed record PairVisualResult(string? Image, List<RenderPieceReport> Pieces);
+sealed record PieceVisualRecord(string Template, string Id, string DeclaredType, string Mesh, string? Image, RenderPieceReport Measurements);
 
 sealed class FbxMeshIndex
 {
     private readonly Dictionary<string, string> _meshToFile = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, MeshGeometry3D?> _geometry = new(StringComparer.OrdinalIgnoreCase);
 
     public FbxMeshIndex(string folder)
     {
@@ -1095,7 +1256,9 @@ sealed class FbxMeshIndex
 
     public MeshGeometry3D? LoadMesh(string meshName)
     {
+        if (_geometry.TryGetValue(meshName, out var cached)) return cached;
         if (!_meshToFile.TryGetValue(meshName, out var path)) return null;
+        MeshGeometry3D? geometry = null;
         try
         {
             using var context = new AssimpContext();
@@ -1105,20 +1268,30 @@ sealed class FbxMeshIndex
             var positions = new Point3DCollection();
             var normals = new Vector3DCollection();
             var indices = new Int32Collection();
-            FindAndCollect(scene.RootNode, scene, meshName, positions, normals, indices, IdentityMatrix());
+            FindAndCollect(
+                scene.RootNode,
+                scene,
+                meshName,
+                positions,
+                normals,
+                indices,
+                IdentityMatrix(),
+                FbxCoordinates.Read(path));
             if (positions.Count == 0) return null;
-            var geometry = new MeshGeometry3D { Positions = positions, Normals = normals, TriangleIndices = indices };
+            geometry = new MeshGeometry3D { Positions = positions, Normals = normals, TriangleIndices = indices };
             geometry.Freeze();
-            return geometry;
         }
         catch
         {
-            return null;
+            // A malformed or incomplete mesh stays cached as missing.
         }
+        _geometry[meshName] = geometry;
+        return geometry;
     }
 
     private static bool FindAndCollect(Node node, Scene scene, string target,
-        Point3DCollection pos, Vector3DCollection nrm, Int32Collection idx, Assimp.Matrix4x4 parent)
+        Point3DCollection pos, Vector3DCollection nrm, Int32Collection idx, Assimp.Matrix4x4 parent,
+        FbxCoordinates coordinates)
     {
         var world = parent * node.Transform;
 
@@ -1139,16 +1312,22 @@ sealed class FbxMeshIndex
                 var mesh = scene.Meshes[mi];
                 var baseIdx = pos.Count;
                 foreach (var v in mesh.Vertices)
-                    pos.Add(new Point3D(
+                {
+                    var transformed = coordinates.TransformPosition(
                         world.A1 * v.X + world.A2 * v.Y + world.A3 * v.Z + world.A4,
                         world.B1 * v.X + world.B2 * v.Y + world.B3 * v.Z + world.B4,
-                        world.C1 * v.X + world.C2 * v.Y + world.C3 * v.Z + world.C4));
+                        world.C1 * v.X + world.C2 * v.Y + world.C3 * v.Z + world.C4);
+                    pos.Add(new Point3D(transformed.X, transformed.Y, transformed.Z));
+                }
                 if (mesh.HasNormals)
                     foreach (var n in mesh.Normals)
-                        nrm.Add(new Vector3D(
+                    {
+                        var transformed = coordinates.TransformDirection(
                             world.A1 * n.X + world.A2 * n.Y + world.A3 * n.Z,
                             world.B1 * n.X + world.B2 * n.Y + world.B3 * n.Z,
-                            world.C1 * n.X + world.C2 * n.Y + world.C3 * n.Z));
+                            world.C1 * n.X + world.C2 * n.Y + world.C3 * n.Z);
+                        nrm.Add(new Vector3D(transformed.X, transformed.Y, transformed.Z));
+                    }
                 else
                     for (var i = 0; i < mesh.VertexCount; i++) nrm.Add(new Vector3D(0, 1, 0));
                 foreach (var face in mesh.Faces)
@@ -1163,7 +1342,7 @@ sealed class FbxMeshIndex
         }
 
         foreach (var child in node.Children)
-            if (FindAndCollect(child, scene, target, pos, nrm, idx, world))
+            if (FindAndCollect(child, scene, target, pos, nrm, idx, world, coordinates))
                 return true;
         return false;
     }
@@ -1197,7 +1376,8 @@ sealed class FbxBoundsIndex
             try
             {
                 var scene = context.ImportFile(path, PostProcessSteps.None);
-                if (scene?.RootNode is not null) IndexNode(scene.RootNode, scene, IdentityMatrix());
+                if (scene?.RootNode is not null)
+                    IndexNode(scene.RootNode, scene, IdentityMatrix(), FbxCoordinates.Read(path));
             }
             catch
             {
@@ -1211,14 +1391,14 @@ sealed class FbxBoundsIndex
         return _bounds.TryGetValue(meshName, out var cached) ? cached : null;
     }
 
-    private void IndexNode(Node node, Scene scene, Assimp.Matrix4x4 parent)
+    private void IndexNode(Node node, Scene scene, Assimp.Matrix4x4 parent, FbxCoordinates coordinates)
     {
         var world = parent * node.Transform;
-        AddName(node.Name, BoundsForMeshes(node.MeshIndices, scene, world));
+        AddName(node.Name, BoundsForMeshes(node.MeshIndices, scene, world, coordinates));
         foreach (var meshIndex in node.MeshIndices)
             if (meshIndex >= 0 && meshIndex < scene.MeshCount)
-                AddName(scene.Meshes[meshIndex].Name, BoundsForMeshes([meshIndex], scene, world));
-        foreach (var child in node.Children) IndexNode(child, scene, world);
+                AddName(scene.Meshes[meshIndex].Name, BoundsForMeshes([meshIndex], scene, world, coordinates));
+        foreach (var child in node.Children) IndexNode(child, scene, world, coordinates);
     }
 
     private void AddName(string name, MeshBounds? bounds)
@@ -1228,7 +1408,11 @@ sealed class FbxBoundsIndex
         if (name.EndsWith(".lod0", StringComparison.OrdinalIgnoreCase)) _bounds.TryAdd(name[..^5], bounds);
     }
 
-    private static MeshBounds? BoundsForMeshes(IEnumerable<int> meshIndices, Scene scene, Assimp.Matrix4x4 world)
+    private static MeshBounds? BoundsForMeshes(
+        IEnumerable<int> meshIndices,
+        Scene scene,
+        Assimp.Matrix4x4 world,
+        FbxCoordinates coordinates)
     {
         var found = false;
         var minY = float.PositiveInfinity;
@@ -1238,9 +1422,12 @@ sealed class FbxBoundsIndex
             if (meshIndex < 0 || meshIndex >= scene.MeshCount) continue;
             foreach (var vertex in scene.Meshes[meshIndex].Vertices)
             {
-                var y = world.B1 * vertex.X + world.B2 * vertex.Y + world.B3 * vertex.Z + world.B4;
-                minY = MathF.Min(minY, y);
-                maxY = MathF.Max(maxY, y);
+                var transformed = coordinates.TransformPosition(
+                    world.A1 * vertex.X + world.A2 * vertex.Y + world.A3 * vertex.Z + world.A4,
+                    world.B1 * vertex.X + world.B2 * vertex.Y + world.B3 * vertex.Z + world.B4,
+                    world.C1 * vertex.X + world.C2 * vertex.Y + world.C3 * vertex.Z + world.C4);
+                minY = MathF.Min(minY, transformed.Y);
+                maxY = MathF.Max(maxY, transformed.Y);
                 found = true;
             }
         }
@@ -1261,6 +1448,118 @@ sealed class FbxBoundsIndex
         matrix.A1 = matrix.B2 = matrix.C3 = matrix.D4 = 1f;
         return matrix;
     }
+}
+
+readonly record struct FbxCoordinates(float UnitScale, int UpAxis, int UpAxisSign)
+{
+    private static readonly byte[] UnitScaleFactor = Encoding.ASCII.GetBytes("UnitScaleFactor");
+    private static readonly byte[] UpAxisProperty = Encoding.ASCII.GetBytes("UpAxis");
+    private static readonly byte[] UpAxisSignProperty = Encoding.ASCII.GetBytes("UpAxisSign");
+
+    public static FbxCoordinates Read(string path)
+    {
+        using var stream = File.OpenRead(path);
+        var bytes = new byte[(int)Math.Min(stream.Length, 256 * 1024)];
+        stream.ReadExactly(bytes);
+
+        var binary = bytes.AsSpan().StartsWith("Kaydara FBX Binary  "u8);
+        var scale = binary
+            ? ReadBinaryDouble(bytes, UnitScaleFactor, 1d)
+            : ReadAsciiDouble(bytes, "UnitScaleFactor", 1d);
+        var upAxis = binary
+            ? ReadBinaryInt(bytes, UpAxisProperty, 1)
+            : ReadAsciiInt(bytes, "UpAxis", 1);
+        var upAxisSign = binary
+            ? ReadBinaryInt(bytes, UpAxisSignProperty, 1)
+            : ReadAsciiInt(bytes, "UpAxisSign", 1);
+        return new FbxCoordinates(
+            IsValidScale(scale) ? (float)scale : 1f,
+            upAxis is >= 0 and <= 2 ? upAxis : 1,
+            upAxisSign == -1 ? -1 : 1);
+    }
+
+    public (float X, float Y, float Z) TransformPosition(float x, float y, float z)
+    {
+        var transformed = TransformDirection(x, y, z);
+        return (
+            transformed.X * UnitScale,
+            transformed.Y * UnitScale,
+            transformed.Z * UnitScale);
+    }
+
+    public (float X, float Y, float Z) TransformDirection(float x, float y, float z) =>
+        UpAxis switch
+        {
+            0 => (-UpAxisSign * y, UpAxisSign * x, z),
+            2 => (x, UpAxisSign * z, -UpAxisSign * y),
+            _ => (x, UpAxisSign * y, UpAxisSign * z),
+        };
+
+    private static double ReadBinaryDouble(byte[] bytes, byte[] property, double fallback)
+    {
+        var offset = FindBinaryProperty(bytes, property);
+        if (offset < 0) return fallback;
+        var end = Math.Min(bytes.Length - sizeof(double) - 1, offset + property.Length + 128);
+        for (var index = offset + property.Length; index <= end; index++)
+            if (bytes[index] == (byte)'D')
+                return BitConverter.ToDouble(bytes, index + 1);
+        return fallback;
+    }
+
+    private static int ReadBinaryInt(byte[] bytes, byte[] property, int fallback)
+    {
+        var offset = FindBinaryProperty(bytes, property);
+        if (offset < 0) return fallback;
+        var end = Math.Min(bytes.Length - sizeof(int) - 1, offset + property.Length + 128);
+        for (var index = offset + property.Length; index <= end; index++)
+            if (bytes[index] == (byte)'I')
+            {
+                var value = BitConverter.ToInt32(bytes, index + 1);
+                if (value is >= -2 and <= 2) return value;
+            }
+        return fallback;
+    }
+
+    private static int FindBinaryProperty(byte[] bytes, byte[] property)
+    {
+        for (var offset = 0; offset <= bytes.Length - property.Length; offset++)
+        {
+            if (!bytes.AsSpan(offset, property.Length).SequenceEqual(property)) continue;
+            if (offset > 0 && IsAsciiLetter(bytes[offset - 1])) continue;
+            return offset;
+        }
+        return -1;
+    }
+
+    private static double ReadAsciiDouble(byte[] bytes, string property, double fallback)
+    {
+        var text = Encoding.UTF8.GetString(bytes);
+        var match = System.Text.RegularExpressions.Regex.Match(
+            text,
+            $@"P:\s*""{System.Text.RegularExpressions.Regex.Escape(property)}"",\s*""double"",\s*""Number"",\s*"""",\s*(?<value>[-+0-9.eE]+)");
+        return match.Success &&
+               double.TryParse(match.Groups["value"].Value, NumberStyles.Float, CultureInfo.InvariantCulture, out var scale)
+            ? scale
+            : fallback;
+    }
+
+    private static int ReadAsciiInt(byte[] bytes, string property, int fallback)
+    {
+        var text = Encoding.UTF8.GetString(bytes);
+        var match = System.Text.RegularExpressions.Regex.Match(
+            text,
+            $@"P:\s*""{System.Text.RegularExpressions.Regex.Escape(property)}"",\s*""int"",\s*""Integer"",\s*"""",\s*(?<value>-?\d+)");
+        return match.Success &&
+               int.TryParse(match.Groups["value"].Value, NumberStyles.Integer, CultureInfo.InvariantCulture, out var value)
+            ? value
+            : fallback;
+    }
+
+    private static bool IsValidScale(double scale) =>
+        double.IsFinite(scale) && scale > 0d && scale <= 1_000_000d;
+
+    private static bool IsAsciiLetter(byte value) =>
+        value is >= (byte)'A' and <= (byte)'Z' or >= (byte)'a' and <= (byte)'z';
 }
 
 static class CliJson
