@@ -98,7 +98,7 @@ Two numbers describe the fit (both in XML units, from mesh bounds):
 
 | Measure | Meaning |
 |---|---|
-| `mouth_gap` | **+** separates the scabbard's mouth from the guard, **−** overlaps it. Near-zero is correct. |
+| `mouth_offset` | Where the scabbard mouth sits relative to the blade base: **+** above it, **−** below it. Near-zero is correct. |
 | `tip_coverage` | **+** the scabbard encloses the blade tip, **−** the blade **protrudes out of the closed end**. Must be ≥ 0. |
 
 A negative `tip_coverage` is a genuine content bug — usually a long blade reusing a short shared scabbard
