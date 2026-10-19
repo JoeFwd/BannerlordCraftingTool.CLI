@@ -17,7 +17,7 @@ try
 {
     if (args.Length == 0 || args[0] is "--help" or "-h")
     {
-    Console.WriteLine("Usage:\n  BannerlordCraftingTool.Cli extract --pieces <crafting_pieces.xml> [--out <report.json>]\n  BannerlordCraftingTool.Cli inspect --submodule <SubModule.xml> --weapon <CraftedItem-id> [--weapon <CraftedItem-id> ...] [--out <report.json>]\n  BannerlordCraftingTool.Cli audit --submodule <SubModule.xml> --fbx-folder <folder> (--all-templates | --template <id> ...) [--all-pairs [--render-dir <dir>]] [--scale-percent <positive-integer>] [--tolerance <xml-units>] [--out <report.json>]\n  BannerlordCraftingTool.Cli render --submodule <SubModule.xml> --weapon <CraftedItem-id> --fbx-folder <folder> --out <dir>\n\n  The module dependency stack is resolved from SubModule.xml; use --modules-root <Modules> to override the selected module's parent directory.\n  An --fbx-folder directly under AssetSources expands to the AssetSources root so sibling FBX collections are included.\n  audit measures visual mesh bounds across physically adjacent pieces; default_polearm_guard/pommel placeholder slots are collapsed.\n  --scale-percent uniformly scales every audit piece and defaults to 100.\n  --all-pairs checks every player-selectable physical pair, and --render-dir writes pair PNGs plus declared-type piece galleries.\n  audit never edits XML. render assembles the weapon as the GUI does, renders three orthographic views to <dir>\\render.png, and emits 3D measurements to <dir>\\render.json.\n  One --weapon returns a flat report; repeated --weapon returns { weapons, source_files }.\n  layout is a compatibility alias for inspect.");
+    Console.WriteLine("Usage:\n  BannerlordCraftingTool.Cli extract --pieces <crafting_pieces.xml> [--out <dir>]\n  BannerlordCraftingTool.Cli inspect --submodule <SubModule.xml> --weapon <CraftedItem-id> [--weapon <CraftedItem-id> ...] [--out <dir>]\n  BannerlordCraftingTool.Cli audit --submodule <SubModule.xml> --fbx-folder <folder> (--all-templates | --template <id> ...) [--all-pairs] [--scale-percent <positive-integer>] [--tolerance <xml-units>] [--out <dir>]\n  BannerlordCraftingTool.Cli render --submodule <SubModule.xml> --weapon <CraftedItem-id> --fbx-folder <folder> --out <dir> [--holstered]\n\n  --out is always an output directory and is created if missing: extract writes pieces.json, inspect writes inspect.json, audit writes audit.json, render writes render.png plus render.json.\n  Omit --out on extract, inspect and audit to print the JSON to stdout instead; render requires it.\n  The module dependency stack is resolved from SubModule.xml; use --modules-root <Modules> to override the selected module's parent directory.\n  An --fbx-folder directly under AssetSources expands to the AssetSources root so sibling FBX collections are included.\n  audit measures visual mesh bounds across physically adjacent pieces; default_polearm_guard/pommel placeholder slots are collapsed.\n  --scale-percent uniformly scales every audit piece and defaults to 100.\n  --all-pairs checks every player-selectable physical pair, and writes pair PNGs plus declared-type piece galleries into --out when one is given.\n  audit never edits XML. render assembles the weapon as the GUI does, renders three orthographic views to <dir>\\render.png, and emits 3D measurements to <dir>\\render.json.\n  render draws the blade's holster mesh translucently over the weapon pieces and reports it under scabbard: mouth_offset (holster mouth relative to the blade base, + sits above it, - below it) and tip_coverage (+ encloses the blade tip, - lets it protrude).\n  render --holstered instead follows the sheathed engine path: the holster is placed by the template's piece_type_to_scale_holster_with and hidden_piece_types_on_holster piece types are omitted.\n  One --weapon returns a flat report; repeated --weapon returns { weapons, source_files }.\n  layout is a compatibility alias for inspect.");
         return;
     }
 
@@ -50,7 +50,7 @@ catch (Exception exception) when (exception is ArgumentException or IOException 
 static void Extract(IReadOnlyDictionary<string, List<string>> options)
 {
     var pieces = LoadPieces(RequiredOption(options, "pieces"));
-    WriteJson(new { pieces }, options);
+    CommandOutput.Read(options).WriteJson(new { pieces }, "pieces.json");
 }
 
 static void Layout(IReadOnlyDictionary<string, List<string>> options)
@@ -73,10 +73,11 @@ static void Layout(IReadOnlyDictionary<string, List<string>> options)
         crafting_templates = craftedItemData.SourceFiles.CraftingTemplates,
         items = craftedItemData.ItemPaths,
     };
+    var output = CommandOutput.Read(options);
     if (reports.Count == 1)
     {
         var report = reports[0];
-        WriteJson(new
+        output.WriteJson(new
         {
             report.Id,
             report.Template,
@@ -86,11 +87,11 @@ static void Layout(IReadOnlyDictionary<string, List<string>> options)
             report.WeaponLength,
             report.HandToBottom,
             source_files = sourceFiles,
-        }, options);
+        }, "inspect.json");
         return;
     }
 
-    WriteJson(new { weapons = reports, source_files = sourceFiles }, options);
+    output.WriteJson(new { weapons = reports, source_files = sourceFiles }, "inspect.json");
 }
 
 static string ResolveFbxSearchRoot(string folder)
@@ -120,12 +121,9 @@ static void Audit(IReadOnlyDictionary<string, List<string>> options)
         ? ParsePositiveInt(SingleOption(scalePercentValues, "scale-percent"), "scale-percent")
         : 100;
     var allPairs = options.ContainsKey("all-pairs");
-    var renderDir = options.TryGetValue("render-dir", out var renderDirValues)
-        ? Path.GetFullPath(SingleOption(renderDirValues, "render-dir"))
-        : null;
-    if (renderDir is not null && !allPairs)
-        throw new ArgumentException("--render-dir requires --all-pairs.");
-    if (renderDir is not null) Directory.CreateDirectory(renderDir);
+    var output = CommandOutput.Read(options);
+    // Pair and gallery PNGs only exist when a sweep asked for them and --out says where to put them.
+    var renderDir = allPairs ? output.Directory : null;
 
     var data = LoadSubModuleCraftingData(subModule, options);
     var piecesById = data.Pieces.ToDictionary(piece => piece.Id, StringComparer.OrdinalIgnoreCase);
@@ -212,7 +210,7 @@ static void Audit(IReadOnlyDictionary<string, List<string>> options)
         }
     }
 
-    WriteJson(new
+    output.WriteJson(new
     {
         audit_strategy = allPairs ? "complete_player_selectable_physical_pair_sweep" : "fixed_reference_physical_piece_sweep",
         scale_percent = scalePercent,
@@ -230,7 +228,7 @@ static void Audit(IReadOnlyDictionary<string, List<string>> options)
             records_with_missing_meshes = records.Count(record => record.MissingMeshes.Count > 0),
         },
         source_files = new { crafting_pieces = data.SourceFiles.CraftingPieces, crafting_templates = data.SourceFiles.CraftingTemplates },
-    }, options);
+    }, "audit.json");
 }
 
 static void Render(IReadOnlyDictionary<string, List<string>> options)
@@ -241,8 +239,8 @@ static void Render(IReadOnlyDictionary<string, List<string>> options)
     if (!Directory.Exists(requestedFbxFolder))
         throw new ArgumentException($"FBX folder does not exist: '{requestedFbxFolder}'.");
     var fbxFolder = ResolveFbxSearchRoot(requestedFbxFolder);
-    var outDir = RequiredOption(options, "out");
-    Directory.CreateDirectory(outDir);
+    var outDir = CommandOutput.Read(options).RequireDirectory();
+    var holstered = options.ContainsKey("holstered");
 
     var data = LoadSubModuleCraftingData(subModule, options, loadItems: true);
     var piecesById = data.Pieces.ToDictionary(piece => piece.Id, StringComparer.OrdinalIgnoreCase);
@@ -250,9 +248,18 @@ static void Render(IReadOnlyDictionary<string, List<string>> options)
 
     var meshIndex = new FbxMeshIndex(fbxFolder);
     var orderedPieces = layout.Pieces.OrderBy(piece => piece.BuildOrder).ToList();
+    data.Templates.TryGetValue(layout.Template, out var template);
 
-    var assembled = AssembleRenderPieces(orderedPieces, meshIndex);
+    var allAssembled = RenderPieceFactory.Assemble(meshIndex, orderedPieces);
+    var hiddenTypes = holstered && template is not null ? template.HiddenPieceTypesOnHolster : [];
+    var assembled = allAssembled
+        .Where(piece => !hiddenTypes.Contains(piece.Type, StringComparer.OrdinalIgnoreCase))
+        .ToList();
     var missing = assembled.Where(piece => piece.Geometry is null).Select(piece => piece.Mesh).ToList();
+
+    // The holster is measured against every piece, including the ones the sheathed view hides behind it.
+    var scabbard = ScabbardComposer.For(meshIndex, holstered).Compose(layout, allAssembled, piecesById, template, hiddenTypes);
+    if (scabbard.Report.Status == "mesh_not_found" && scabbard.Report.Mesh is not null) missing.Add(scabbard.Report.Mesh);
 
     var found = assembled.Where(piece => piece.Bounds is not null).ToList();
     var imagePath = Path.GetFullPath(Path.Combine(outDir, "render.png"));
@@ -262,10 +269,17 @@ static void Render(IReadOnlyDictionary<string, List<string>> options)
     {
         var (min, max) = CombinedBounds(found);
         assembledBounds = new BoundsReport(min, max);
-        RenderImage(found, min, max, imagePath);
     }
 
-    var pieceReports = assembled.Select(ToRenderPieceReport).ToList();
+    // The scabbard is drawn last so WPF blends it over the pieces it encloses.
+    List<RenderPiece> drawn = scabbard.Piece is null ? found : [.. found, scabbard.Piece];
+    if (drawn.Count > 0)
+    {
+        var (min, max) = CombinedBounds(drawn);
+        RenderImage(drawn, min, max, imagePath);
+    }
+
+    var pieceReports = assembled.Select(RenderPieceReport.From).ToList();
 
     var seams = new List<RenderSeam>();
     for (var i = 0; i + 1 < assembled.Count; i++)
@@ -286,6 +300,7 @@ static void Render(IReadOnlyDictionary<string, List<string>> options)
         assembled_bounds = assembledBounds,
         pieces = pieceReports,
         seams,
+        scabbard = scabbard.Report,
         missing_meshes = missing,
     };
     var json = JsonSerializer.Serialize(report, CliJson.Options);
@@ -293,53 +308,11 @@ static void Render(IReadOnlyDictionary<string, List<string>> options)
     Console.WriteLine(json);
 }
 
-static List<RenderPiece> AssembleRenderPieces(IEnumerable<PieceReport> pieces, FbxMeshIndex meshIndex) =>
-    pieces.Select(piece => CreateRenderPiece(piece.Type, piece.Id, piece.Mesh, piece.ScaleFactor, piece.Pivot, meshIndex)).ToList();
-
-static RenderPiece CreateRenderPiece(string type, string id, string mesh, int scaleFactor, float pivot, FbxMeshIndex meshIndex)
-{
-    var geometry = meshIndex.LoadMesh(mesh);
-    var scale = scaleFactor * 0.01f;
-    Bounds? worldBounds = null;
-    if (geometry is not null)
-    {
-        float minX = float.PositiveInfinity, minY = float.PositiveInfinity, minZ = float.PositiveInfinity;
-        float maxX = float.NegativeInfinity, maxY = float.NegativeInfinity, maxZ = float.NegativeInfinity;
-        foreach (var point in geometry.Positions)
-        {
-            var x = (float)point.X * scale;
-            var y = (float)point.Y * scale + pivot;
-            var z = (float)point.Z * scale;
-            minX = MathF.Min(minX, x); maxX = MathF.Max(maxX, x);
-            minY = MathF.Min(minY, y); maxY = MathF.Max(maxY, y);
-            minZ = MathF.Min(minZ, z); maxZ = MathF.Max(maxZ, z);
-        }
-        worldBounds = new Bounds(minX, minY, minZ, maxX, maxY, maxZ);
-    }
-    return new RenderPiece(type, id, mesh, scaleFactor, pivot, geometry, scale, pivot, worldBounds);
-}
-
 static (float[] Min, float[] Max) CombinedBounds(IReadOnlyCollection<RenderPiece> pieces) =>
 (
     [pieces.Min(piece => piece.Bounds!.MinX), pieces.Min(piece => piece.Bounds!.MinY), pieces.Min(piece => piece.Bounds!.MinZ)],
     [pieces.Max(piece => piece.Bounds!.MaxX), pieces.Max(piece => piece.Bounds!.MaxY), pieces.Max(piece => piece.Bounds!.MaxZ)]
 );
-
-static RenderPieceReport ToRenderPieceReport(RenderPiece piece)
-{
-    var bounds = piece.Bounds;
-    return new RenderPieceReport(
-        piece.Type,
-        piece.Id,
-        piece.Mesh,
-        piece.ScaleFactor,
-        piece.PivotXml,
-        bounds is not null,
-        bounds is null ? null : new BoundsReport([bounds.MinX, bounds.MinY, bounds.MinZ], [bounds.MaxX, bounds.MaxY, bounds.MaxZ]),
-        bounds is null ? null : [(bounds.MinX + bounds.MaxX) / 2f, (bounds.MinY + bounds.MaxY) / 2f, (bounds.MinZ + bounds.MaxZ) / 2f],
-        bounds is null ? null : new LateralOffset((bounds.MinX + bounds.MaxX) / 2f, (bounds.MinZ + bounds.MaxZ) / 2f),
-        bounds is null ? null : new AxisExtent(bounds.MinY, bounds.MaxY));
-}
 
 static void RenderImage(List<RenderPiece> pieces, float[] min, float[] max, string imagePath, bool compact = false)
 {
@@ -356,7 +329,7 @@ static void RenderImage(List<RenderPiece> pieces, float[] min, float[] max, stri
                 var color = PieceColor(piece.Type);
                 var material = new DiffuseMaterial(new SolidColorBrush(color));
                 var transform = new Transform3DGroup();
-                transform.Children.Add(new ScaleTransform3D(piece.Scale, piece.Scale, piece.Scale));
+                transform.Children.Add(new ScaleTransform3D(piece.LateralScale, piece.Scale, piece.LateralScale));
                 transform.Children.Add(new TranslateTransform3D(0, piece.Pivot, 0));
                 group.Children.Add(new GeometryModel3D(piece.Geometry, material)
                 {
@@ -493,6 +466,8 @@ static Color PieceColor(string type) => type.ToLowerInvariant() switch
     "guard" => (Color)ColorConverter.ConvertFromString("#E0A64F")!,
     "handle" => (Color)ColorConverter.ConvertFromString("#5FBF6A")!,
     "pommel" => (Color)ColorConverter.ConvertFromString("#C05FBF")!,
+    // Translucent so the enclosed blade stays readable through the holster.
+    "scabbard" => Color.FromArgb(115, 0xC8, 0xA1, 0x65),
     _ => (Color)ColorConverter.ConvertFromString("#B0B0B0")!,
 };
 
@@ -578,7 +553,7 @@ static PairVisualResult RenderAuditPair(
             || piece.Type.Equals(tipOrder.Type, StringComparison.OrdinalIgnoreCase))
         .OrderBy(piece => piece.BuildOrder)
         .ToList();
-    var assembled = AssembleRenderPieces(reports, meshIndex);
+    var assembled = RenderPieceFactory.Assemble(meshIndex, reports);
     var found = assembled.Where(piece => piece.Bounds is not null).ToList();
     string? imagePath = null;
     if (found.Count > 0)
@@ -591,12 +566,12 @@ static PairVisualResult RenderAuditPair(
         var (min, max) = CombinedBounds(found);
         RenderImage(found, min, max, imagePath, compact: true);
     }
-    return new PairVisualResult(imagePath, assembled.Select(ToRenderPieceReport).ToList());
+    return new PairVisualResult(imagePath, assembled.Select(RenderPieceReport.From).ToList());
 }
 
 static PieceVisualRecord RenderPieceVisual(string templateId, CraftingPiece piece, FbxMeshIndex meshIndex, string renderDir, int scalePercent)
 {
-    var assembled = CreateRenderPiece(piece.PieceType, piece.Id, piece.Mesh, scalePercent, 0, meshIndex);
+    var assembled = RenderPieceFactory.Create(meshIndex, piece.PieceType, piece.Id, piece.Mesh, scalePercent, 0, piece.FullScale);
     string? imagePath = null;
     if (assembled.Bounds is not null)
     {
@@ -606,7 +581,7 @@ static PieceVisualRecord RenderPieceVisual(string templateId, CraftingPiece piec
         var (min, max) = CombinedBounds([assembled]);
         RenderImage([assembled], min, max, imagePath, compact: true);
     }
-    return new PieceVisualRecord(templateId, piece.Id, piece.PieceType, piece.Mesh, imagePath, ToRenderPieceReport(assembled));
+    return new PieceVisualRecord(templateId, piece.Id, piece.PieceType, piece.Mesh, imagePath, RenderPieceReport.From(assembled));
 }
 
 static string SafePathSegment(string value, int maxLength = 64)
@@ -796,8 +771,21 @@ static Dictionary<string, TemplateData> ParseTemplates(XDocument document)
             .Where(id => !string.IsNullOrWhiteSpace(id))
             .Cast<string>()
             .ToList() ?? [];
+        var hiddenOnHolster = (template.Attribute("hidden_piece_types_on_holster")?.Value ?? "")
+            .Split(':')
+            .Select(type => type.Trim())
+            .Where(type => type.Length > 0)
+            .ToList();
+        var scaleHolsterWith = template.Attribute("piece_type_to_scale_holster_with")?.Value?.Trim();
         if (!string.IsNullOrWhiteSpace(id) && buildOrder is { Length: > 0 })
-            templates[id] = new TemplateData(id, buildOrder, usable);
+            templates[id] = new TemplateData(
+                id,
+                buildOrder,
+                usable,
+                template.Attribute("use_weapon_as_holster_mesh")?.Value == "true",
+                template.Attribute("always_show_holster_with_weapon")?.Value == "true",
+                string.IsNullOrWhiteSpace(scaleHolsterWith) ? null : scaleHolsterWith,
+                hiddenOnHolster);
     }
     return templates;
 }
@@ -1024,6 +1012,8 @@ static CraftingPiece? ParsePiece(XElement element)
     }
 
     var buildData = element.Element("BuildData");
+    var holsterMesh = element.Element("BladeData")?.Attribute("holster_mesh")?.Value;
+    var fullScaleAttribute = element.Attribute("full_scale")?.Value;
     return new CraftingPiece(
         id,
         pieceType,
@@ -1033,14 +1023,11 @@ static CraftingPiece? ParsePiece(XElement element)
         distanceToPrevious,
         ParseBuildData(buildData, "piece_offset"),
         ParseBuildData(buildData, "previous_piece_offset"),
-        ParseBuildData(buildData, "next_piece_offset"));
-}
-
-static void WriteJson<T>(T value, IReadOnlyDictionary<string, List<string>> options)
-{
-    var json = JsonSerializer.Serialize(value, CliJson.Options);
-    if (options.TryGetValue("out", out var outputPaths)) File.WriteAllText(SingleOption(outputPaths, "out"), json);
-    else Console.WriteLine(json);
+        ParseBuildData(buildData, "next_piece_offset"),
+        string.IsNullOrWhiteSpace(holsterMesh) ? null : holsterMesh,
+        fullScaleAttribute is not null
+            ? fullScaleAttribute == "true"
+            : pieceType.Equals("Guard", StringComparison.OrdinalIgnoreCase) || pieceType.Equals("Pommel", StringComparison.OrdinalIgnoreCase));
 }
 
 static string RequiredOption(IReadOnlyDictionary<string, List<string>> options, string name) =>
@@ -1059,7 +1046,8 @@ static Dictionary<string, List<string>> ReadOptions(string[] arguments)
         var name = arguments[index][2..];
         if (!options.TryGetValue(name, out var values)) options[name] = values = [];
         if (name.Equals("all-templates", StringComparison.OrdinalIgnoreCase)
-            || name.Equals("all-pairs", StringComparison.OrdinalIgnoreCase))
+            || name.Equals("all-pairs", StringComparison.OrdinalIgnoreCase)
+            || name.Equals("holstered", StringComparison.OrdinalIgnoreCase))
         {
             values.Add("true");
             index++;
@@ -1105,7 +1093,9 @@ sealed record CraftingPiece(
     float DistanceToPreviousPiece,
     float PieceOffset,
     float PreviousPieceOffset,
-    float NextPieceOffset);
+    float NextPieceOffset,
+    string? HolsterMesh,
+    bool FullScale);
 
 sealed record ResolvedCraftingData(
     List<CraftingPiece> Pieces,
@@ -1121,7 +1111,14 @@ sealed record XmlDeclaration(string ModuleRoot, string? Path);
 sealed record XmlSource(string? XmlPath, string TransformBasePath);
 sealed record SourceFiles(List<string> CraftingPieces, List<string> CraftingTemplates);
 sealed record BuildOrder(string Type, int Order);
-sealed record TemplateData(string Id, BuildOrder[] BuildOrder, List<string> UsablePieceIds);
+sealed record TemplateData(
+    string Id,
+    BuildOrder[] BuildOrder,
+    List<string> UsablePieceIds,
+    bool UseWeaponAsHolsterMesh,
+    bool AlwaysShowHolsterWithWeapon,
+    string? PieceTypeToScaleHolsterWith,
+    List<string> HiddenPieceTypesOnHolster);
 sealed record WeaponRequest(string Id, string Template, List<PieceRequest> Pieces);
 sealed record PieceRequest(string Type, string Id, int? ScaleFactor);
 sealed record SelectedPiece(CraftingPiece Piece, int ScaleFactor);
@@ -1145,7 +1142,8 @@ sealed record PieceReport(
     float ScaledDistanceToPreviousPiece,
     float ScaledPieceOffset,
     float ScaledPreviousPieceOffset,
-    float ScaledNextPieceOffset)
+    float ScaledNextPieceOffset,
+    bool FullScale)
 {
     public static PieceReport Create(string type, SelectedPiece selected, float pivot, int buildOrder)
     {
@@ -1155,7 +1153,8 @@ sealed record PieceReport(
         var previous = piece.DistanceToPreviousPiece * scale;
         return new PieceReport(type, piece.Id, piece.Mesh, buildOrder, selected.ScaleFactor, pivot, pivot - previous, pivot + next,
             piece.Length, piece.DistanceToNextPiece, piece.DistanceToPreviousPiece, piece.PieceOffset, piece.PreviousPieceOffset, piece.NextPieceOffset,
-            piece.Length * scale, next, previous, piece.PieceOffset * scale, piece.PreviousPieceOffset * scale, piece.NextPieceOffset * scale);
+            piece.Length * scale, next, previous, piece.PieceOffset * scale, piece.PreviousPieceOffset * scale, piece.NextPieceOffset * scale,
+            piece.FullScale);
     }
 }
 
@@ -1197,7 +1196,7 @@ sealed record VisualAuditRecord(
 }
 
 sealed record Bounds(float MinX, float MinY, float MinZ, float MaxX, float MaxY, float MaxZ);
-sealed record RenderPiece(string Type, string Id, string Mesh, int ScaleFactor, float PivotXml, MeshGeometry3D? Geometry, float Scale, float Pivot, Bounds? Bounds);
+sealed record RenderPiece(string Type, string Id, string Mesh, int ScaleFactor, float PivotXml, MeshGeometry3D? Geometry, float Scale, float Pivot, Bounds? Bounds, float LateralScale);
 sealed record BoundsReport(float[] Min, float[] Max);
 sealed record LateralOffset(float X, float Z);
 sealed record AxisExtent(float MinY, float MaxY);
@@ -1211,12 +1210,30 @@ sealed record RenderPieceReport(
     BoundsReport? WorldBounds,
     float[]? Center,
     LateralOffset? LateralOffset,
-    AxisExtent? AxisExtent);
+    AxisExtent? AxisExtent)
+{
+    public static RenderPieceReport From(RenderPiece piece)
+    {
+        var bounds = piece.Bounds;
+        return new RenderPieceReport(
+            piece.Type,
+            piece.Id,
+            piece.Mesh,
+            piece.ScaleFactor,
+            piece.PivotXml,
+            bounds is not null,
+            bounds is null ? null : new BoundsReport([bounds.MinX, bounds.MinY, bounds.MinZ], [bounds.MaxX, bounds.MaxY, bounds.MaxZ]),
+            bounds is null ? null : [(bounds.MinX + bounds.MaxX) / 2f, (bounds.MinY + bounds.MaxY) / 2f, (bounds.MinZ + bounds.MaxZ) / 2f],
+            bounds is null ? null : new LateralOffset((bounds.MinX + bounds.MaxX) / 2f, (bounds.MinZ + bounds.MaxZ) / 2f),
+            bounds is null ? null : new AxisExtent(bounds.MinY, bounds.MaxY));
+    }
+}
+
 sealed record RenderSeam(string GripType, string TipType, float AxisGap);
 sealed record PairVisualResult(string? Image, List<RenderPieceReport> Pieces);
 sealed record PieceVisualRecord(string Template, string Id, string DeclaredType, string Mesh, string? Image, RenderPieceReport Measurements);
 
-sealed class FbxMeshIndex
+sealed class FbxMeshIndex : IMeshCatalog
 {
     private readonly Dictionary<string, string> _meshToFile = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, MeshGeometry3D?> _geometry = new(StringComparer.OrdinalIgnoreCase);
@@ -1253,6 +1270,8 @@ sealed class FbxMeshIndex
         _meshToFile.TryAdd(name, path);
         if (name.EndsWith(".lod0", StringComparison.OrdinalIgnoreCase)) _meshToFile.TryAdd(name[..^5], path);
     }
+
+    public bool Contains(string meshName) => _meshToFile.ContainsKey(meshName);
 
     public MeshGeometry3D? LoadMesh(string meshName)
     {
