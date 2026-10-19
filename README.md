@@ -1,25 +1,14 @@
-# Bannerlord Weapon Piece Aligner
+# Bannerlord Crafting Tool CLI
 
-A standalone Windows tool for **Mount & Blade II: Bannerlord** modders to visually preview and adjust
-weapon **crafting-piece offsets** — without launching the game. It reads your `crafting_pieces.xml`
-(and optionally your FBX meshes) and shows a live 2D + 3D preview of how the assembled weapon will look,
-using the **exact assembly math from the game engine**.
+A headless Windows command-line tool for **Mount & Blade II: Bannerlord** modders that checks weapon
+**crafting-piece offsets** without launching the game. It reads a module's crafting XML (resolving its
+whole dependency stack from `SubModule.xml`) and optionally its FBX meshes, reproduces the **exact
+assembly math from the game engine**, and emits **JSON** (and PNG renders). It is built for
+batch-checking hundreds of piece combinations, diffing results in version control, and driving the tool
+from a script or an AI assistant.
 
-It depends on nothing but two public NuGet packages — **no Bannerlord install, no mod, and no other
-project required to build or run.** It works with vanilla `crafting_pieces.xml` or any mod's.
-
----
-
-## Download & run (no toolchain needed)
-
-1. Grab the latest **`BannerlordCraftingTool-win-x64.zip`** from the **[Releases page](../../releases)**.
-2. Unzip anywhere.
-3. Double-click **`BannerlordCraftingTool.exe`**.
-
-The release build is **self-contained** — it bundles its own .NET runtime, so you do **not** need .NET
-installed. Windows x64 only.
-
-> Prefer to build it yourself? See [Build from source](#build-from-source) below.
+It depends on nothing but a public NuGet package. **No Bannerlord install, no mod, and no other project
+is required to build or run it.** It works with vanilla `crafting_pieces.xml` or any mod's.
 
 ---
 
@@ -37,44 +26,7 @@ weapon's axis. Their positions are controlled by three offset values per piece i
 ```
 
 Tuning these by hand means: edit XML → launch the game → check the crafting bench → repeat. This tool
-replaces that loop with a live preview that reproduces the engine's piece-positioning exactly.
-
----
-
-## How to use
-
-### 1 — Load pieces
-- **Pieces XML** → **Browse** to a `crafting_pieces.xml` and **Load**. Examples:
-  - Vanilla: `…\Mount & Blade II Bannerlord\Modules\Native\ModuleData\crafting_pieces.xml`
-  - A mod: that module's `…\ModuleData\<your>_crafting_pieces.xml`
-  - **Add +** merges a second XML into the current set (e.g. your file + a teammate's).
-- **Templates XSLT** (optional) → **Browse** to a `crafting_templates.xslt` (or a base
-  `crafting_templates.xml`) and **Load**. This filters the piece dropdowns per weapon template. Build
-  orders for all vanilla templates are **bundled**, so this step is optional.
-
-### 2 — Pick a template and pieces
-- Choose a **Weapon Template** (e.g. `OneHandedSword`, `OneHandedAxe`, `TwoHandedPolearm`) to narrow the
-  dropdowns to valid pieces and set the correct assembly order.
-- Use the search box above each dropdown to filter by id. Select a Blade / Guard / Handle / Pommel
-  (axes/maces have no guard — leave it `(None)`). The preview updates live.
-
-### 3 — Adjust offsets
-- Click a piece in the **2D canvas** or the **3D viewport** to make it active (its id shows at the top
-  of the **Offset Editor**).
-- Nudge `piece_offset`, `previous_piece_offset`, `next_piece_offset` with the **−/+** step buttons or by
-  typing a value. Set a per-use `scale_factor (%)` to preview a scaled piece.
-- The **XML Output** panel shows the corrected `<BuildData … />` snippet — **Copy** it back into your XML.
-- **Export tuned offsets (JSON)** writes only the pieces you changed (original + tuned values) — handy
-  for batch-patching your XML or feeding an assistant.
-
-### 4 — 3D preview (optional)
-- Switch to the **3D Preview** tab and set the **FBX Folder** (it indexes every `.fbx` in the folder +
-  subfolders), **or drag `.fbx` files / a folder onto the viewport**.
-- Click any mesh to select that piece. Orbit/zoom with the mouse.
-- **Show scabbard** draws the Blade's holster mesh translucently over the assembled weapon, so you can
-  check that the mouth meets the guard and the tip is fully enclosed. It is a **placement preview only** —
-  where the scabbard sits *on the character's body* is a separate system this tool cannot model (see
-  [Scabbards](#scabbards-holster-meshes)).
+replaces that loop with offline checks that reproduce the engine's piece-positioning exactly.
 
 ---
 
@@ -109,12 +61,11 @@ explicit `distance_to_next_piece` / `distance_to_previous_piece`). The three `<B
 
 The tool **faithfully reproduces** `WeaponDesign.CalculatePivotDistances()` + `CalculateWeaponLength()`
 from the game engine (`TaleWorlds.Core`, v1.4.5) — including `scale_factor` — so the pivot positions and
-the reported **Weapon length** match what the game computes. The grip line (Z=0) stays in frame, so you
-see the whole weapon slide when you change the Handle's `piece_offset`.
+the reported **Weapon length** match what the game computes.
 
 ### XML units
 All values are raw XML units (= centimeters in Blender). The game multiplies by `0.01` internally; the
-tool stays in raw units so what you see matches what you type into the XML. The **Weapon length** readout
+tool stays in raw units so what it reports matches what you type into the XML. The **Weapon length** readout
 is in those units (≈ cm; the `reach` figure is the rounded `WeaponLength` stat the game stores).
 
 ### How `scale_factor` scales
@@ -127,7 +78,7 @@ leaving the piece's cross-section untouched — *unless* the piece declares `ful
 
 When the attribute is absent the default is `PieceType == Guard || PieceType == Pommel`. **Blades and
 Handles therefore scale along their axis only by default** — exactly the pieces most often scaled. The
-tool follows this rule, so a scaled blade is drawn longer but *not* fatter, matching the game.
+tool follows this rule, so a scaled blade renders longer but *not* fatter, matching the game.
 
 ### Scabbards (holster meshes)
 A weapon's scabbard is **not a crafting piece** — it is the `holster_mesh` declared on the **Blade**:
@@ -169,10 +120,6 @@ cannot be reproduced offline; the tool flags these rather than drawing them wron
 ---
 
 ## Command-line interface
-
-A second executable, **`BannerlordCraftingTool.Cli.exe`**, does the same math headlessly and emits **JSON**
-(and PNGs). It exists for what the GUI is bad at: batch-checking hundreds of piece combinations, diffing
-results in version control, and driving the tool from a script or an AI assistant.
 
 ```sh
 dotnet run --project BannerlordCraftingTool.Cli -- <command> [options]
@@ -271,7 +218,7 @@ are collapsed rather than measured. **`audit` never edits your XML** — it only
 BannerlordCraftingTool.Cli render --submodule <S.xml> --weapon <id> --fbx-folder <dir> --out <dir> [--holstered]
 ```
 
-Assembles the weapon exactly as the GUI does and writes **`<dir>\render.png`** (three orthographic views —
+Assembles the weapon and writes **`<dir>\render.png`** (three orthographic views —
 side, front, top) plus **`<dir>\render.json`**. The JSON gives per-piece `world_bounds`, `center`,
 `lateral_offset` and `axis_extent`; `seams[].axis_gap` measured between adjacent meshes; a `scabbard`
 block (see [Scabbards](#scabbards-holster-meshes)); and `missing_meshes`.
@@ -303,11 +250,8 @@ build order — it is looked up separately and placed at the Blade's pivot.
 Requires the **.NET 8 SDK** (`win-x64`).
 
 ```sh
-# from this folder (tools/BannerlordCraftingTool)
-dotnet build                 # compile the GUI
-dotnet run                   # build + launch the GUI
-
-dotnet build BannerlordCraftingTool.Cli                       # compile the CLI
+# from this folder
+dotnet build BannerlordCraftingTool.Cli -c Release            # compile the CLI
 dotnet run --project BannerlordCraftingTool.Cli -- --help     # run it (note the -- separator)
 
 dotnet run --project BannerlordCraftingTool.Cli.Tests -c Release   # run the tests
@@ -321,29 +265,14 @@ stack trace naming the test, and a non-zero exit.
 > Adding a test means two edits at the top of `BannerlordCraftingTool.Cli.Tests/Program.cs`: the call, and
 > the **hard-coded count** in that final `Console.WriteLine`. Bump it or the summary line lies.
 
-### Make a release build (self-contained, no .NET required to run)
-
-```sh
-dotnet publish -c Release -r win-x64 --self-contained true
-# output: bin/Release/net8.0-windows/win-x64/publish/
-```
-
-Zip the `publish/` folder and that's the distributable — the user unzips and runs
-`BannerlordCraftingTool.exe` with no prerequisites. (A folder publish is used rather than single-file
-because AssimpNet's native DLL loads most reliably as a loose file beside the exe.)
-
 ---
 
 ## Project structure
 
 ```
 BannerlordCraftingTool/
-├── BannerlordCraftingTool.csproj       .NET 8 WPF project (the GUI)
-├── App.xaml / App.xaml.cs              WPF entry point
-├── MainWindow.xaml                     UI layout (dark theme, 3-column)
-├── MainWindow.xaml.cs                  parsing, assembly math, 2D canvas, 3D view
 ├── BannerlordCraftingTool.Cli/         headless JSON/PNG tool
-│   ├── Program.cs                      commands, XML/dependency resolution, offscreen rendering
+│   ├── Program.cs                      commands, XML/dependency resolution, assembly math, offscreen rendering
 │   ├── Output/                         resolves `--out` to an output directory, or stdout
 │   ├── Rendering/                      mesh catalog + world-space piece construction
 │   └── Scabbard/                       holster eligibility, placement, measurement, reporting
@@ -351,35 +280,18 @@ BannerlordCraftingTool/
 └── README.md                           this file
 ```
 
-**Dependencies** (NuGet, restored automatically): `AssimpNet 4.1.0` (FBX loading), `HelixToolkit.Wpf 3.1.2`
-(3D viewport, GUI only). Nothing else.
+**Dependencies** (NuGet, restored automatically): `AssimpNet 4.1.0` (FBX loading). Nothing else.
 
 The CLI renders offscreen with WPF's `Viewport3D` + `OrthographicCamera`, which is why it targets
 `net8.0-windows` and needs no display.
 
 ---
 
-## Features
-
-- **Engine-accurate assembly** — verbatim port of the game's pivot + weapon-length math, build-order
-  driven, Handle-anchored, with `scale_factor` support and a live weapon-length / reach readout.
-- **2D + 3D preview** — schematic 2D pivot diagram (grip line always in frame) and a real FBX mesh
-  viewport; click a piece in either to edit it.
-- **Offset editor** — per-piece `piece_offset` / `previous` / `next` + `scale_factor`, with step buttons.
-- **Copy / export** — copy a single corrected `<BuildData>` snippet, or export all tuned pieces to JSON.
-- **Flexible loading** — merge multiple piece XMLs; browse or **drag-and-drop** FBX files/folders.
-- **Scabbard preview** — draw the Blade's holster mesh translucently over the weapon and check the fit
-  numerically via `mouth_gap` / `tip_coverage` (see [Scabbards](#scabbards-holster-meshes)).
-- **Headless CLI** — resolve a module's whole dependency stack from `SubModule.xml`, then dump pieces,
-  inspect one weapon's math, sweep every piece pair for bad seams, or render PNGs + JSON measurements;
-  scriptable and diffable (see [Command-line interface](#command-line-interface)).
-
----
-
 ## Credits & license
 
 Originally built by **KEYforce** for the *Tales from the Age of Men* (TAOM) Bannerlord project; the
-engine-fidelity assembly math and dark theme were added in a later pass. It is a general-purpose modding
+engine-fidelity assembly math and this headless CLI were added in a later pass. The original WPF GUI
+has been removed. It is a general-purpose modding
 utility — usable with any Bannerlord crafting data, not tied to any specific mod.
 
 `TaleWorlds.*` types referenced in this document are TaleWorlds Entertainment's; this tool ships none of
